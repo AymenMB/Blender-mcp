@@ -3,7 +3,8 @@
 A practical, production-ready Blender MCP for real LLM workflows.
 
 **Author:** Aymen Mabrouk  
-**Project context:** Developed under **SeekMake** internship as part of a **final-year engineering project**.
+
+**Project context:** Developed under **SeekMake internship** as part of a **final-year engineering project**.
 
 ---
 
