@@ -3,8 +3,7 @@
 A practical, production-ready Blender MCP for real LLM workflows.
 
 **Author:** Aymen Mabrouk  
-**License:** MIT  
-**Project context:** Developed under **SeekMake internship** as part of a **final-year engineering project**.
+**Project context:** Developed under SeekMake internship as part of a final-year engineering project.
 
 ---
 
@@ -23,9 +22,9 @@ The design goal is **simple + robust**, not over-engineered.
 
 ---
 
-## Why this v2 is “practical perfect” for now
+## Why this v2 matters
 
-This version is optimized for immediate use:
+This version is optimized for immediate use and reliability:
 
 - Dedicated tools for common operations (deterministic, LLM-friendly)
 - Clean fallback path with `execute_blender_code`
@@ -54,7 +53,7 @@ flowchart LR
 
 ## Recommended LLM execution order
 
-> This is why the extra starter prompt exists: it improves consistency and prevents random tool misuse.
+> The starter prompt improves consistency and reduces unexpected tool use.
 
 ```mermaid
 flowchart TD
@@ -129,7 +128,7 @@ In your `mcp.json`, use:
 }
 ```
 
-> This keeps your old `uvx` style but guarantees you run your GitHub version.
+> Uses `uvx` to run the GitHub package.
 
 ### 3) Start session
 
@@ -155,7 +154,7 @@ The e2e script was used to:
 - test real MCP client initialization path,
 - verify end-to-end behavior, not only individual calls.
 
-In short: manual testing checks usability; scripted e2e checks reliability.
+Summary: manual testing verifies usability; the e2e script verifies reliability and catches regressions.
 
 ---
 
