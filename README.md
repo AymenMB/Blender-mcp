@@ -3,7 +3,7 @@
 A practical, production-ready Blender MCP for real LLM workflows.
 
 **Author:** Aymen Mabrouk  
-**Project context:** Developed under SeekMake internship as part of a final-year engineering project.
+**Project context:** Developed under **SeekMake** internship as part of a **final-year engineering project**.
 
 ---
 
@@ -142,21 +142,6 @@ In your `mcp.json`, use:
 
 ---
 
-## Why `_mcp_full_e2e_test.py` was used
-
-Manual tool calls from chat are useful, but they are not enough for full validation.
-
-The e2e script was used to:
-
-- run a **repeatable** sequence of many tools,
-- catch hidden regressions,
-- produce clear pass/fail summary,
-- test real MCP client initialization path,
-- verify end-to-end behavior, not only individual calls.
-
-Summary: manual testing verifies usability; the e2e script verifies reliability and catches regressions.
-
----
 
 ## Prompt engineering in this repo
 
