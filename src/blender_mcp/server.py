@@ -1879,15 +1879,31 @@ def search_blender_docs(
     """
     try:
         blender = get_blender_connection()
-        result = _handle_result(blender.send_command("search_blender_docs", {
+        result = blender.send_command("search_blender_docs", {
             "query": query,
             "category": category,
             "max_results": min(max(1, max_results), 10)
-        }))
+        })
+
+        # In no-RAG setups, docs may not be mounted in Blender's addon path.
+        # Degrade gracefully with a structured, non-throwing response.
+        if isinstance(result, dict) and "error" in result:
+            return json.dumps({
+                "available": False,
+                "message": result.get("error", "Documentation search unavailable."),
+                "hint": "This does not impact core Blender MCP functionality. Set BLENDER_DOCS_PATH later if you want docs search.",
+                "results": []
+            }, indent=2)
+
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error searching docs: {str(e)}")
-        return f"Error searching docs: {str(e)}"
+        return json.dumps({
+            "available": False,
+            "message": f"Documentation search unavailable: {str(e)}",
+            "hint": "Core Blender MCP tools continue to work without docs search.",
+            "results": []
+        }, indent=2)
 
 
 # ============================================================================
