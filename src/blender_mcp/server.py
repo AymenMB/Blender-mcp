@@ -1927,6 +1927,32 @@ def asset_creation_strategy() -> str:
         - Take a final viewport screenshot when useful.
         """
 
+
+@mcp.prompt()
+def llm_starter_system_prompt() -> str:
+    """Starter prompt for LLMs using Blender MCP with deterministic tool order."""
+    return """You are controlling Blender through Blender MCP.
+
+Rules:
+1) Always start with ping_blender(), then get_mcp_capabilities(), then get_scene_info().
+2) Prefer dedicated tools over execute_blender_code().
+3) After every major scene change, verify with get_object_info() or get_viewport_screenshot().
+4) Use integrations only if enabled by get_mcp_capabilities().
+5) Use search_blender_docs() only for advanced API lookup (optional, not required).
+6) Keep actions small and deterministic: create/edit/verify/save.
+7) Before finishing, run save_blend_file().
+
+Default order for most tasks:
+- inspect scene
+- create or import objects
+- transform and organize
+- assign materials and lighting
+- set camera
+- optional animation
+- render/export
+- save
+"""
+
 # Main execution
 
 def main():
