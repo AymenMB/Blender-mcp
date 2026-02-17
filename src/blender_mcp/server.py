@@ -2444,12 +2444,24 @@ def asset_creation_strategy() -> str:
             save_blend_file, open_blend_file, import_file.
         - Use get_object_info() and get_viewport_screenshot() after major changes.
 
-        3) Integrations (only if enabled)
-        - PolyHaven: textures/HDRIs/models
-        - Sketchfab: realistic downloadable models
-        - Poly Pizza: low-poly downloadable models
-        - GitHub Khronos: glTF sample models
-        - Hyper3D / Hunyuan3D: custom single-item generation
+        3) Asset retrieval policy (only if integrations are enabled)
+        - Start with Sketchfab for specific named models (e.g., "Mercedes", "Optimus Prime").
+        - If no relevant result, try Poly Pizza (low-poly) for broad objects.
+        - If still no fit, try PolyHaven (mostly environment/models) and GitHub Khronos samples.
+        - For generated assets, use Hyper3D / Hunyuan3D.
+
+        3.1) Relevance verification before download
+        - Compare requested keywords against candidate title/tags.
+        - Reject candidates that do not match the key intent terms.
+        - For broad queries (e.g., "car"), accept best visual proxy.
+        - For specific queries (e.g., "Mercedes"), do not substitute unrelated brands.
+
+        3.2) Retrieval execution order
+        - search_asset_sources(query, providers=["sketchfab","polypizza","polyhaven","github_khronos"])
+        - choose top relevant candidate
+        - optional: get_sketchfab_model_preview(uid) for visual confirmation
+        - download_asset(source, asset_id, target_size=...)
+        - verify imported object(s) with get_object_info/get_viewport_screenshot
 
         4) Advanced fallback
         - Use execute_blender_code() only when dedicated tools are insufficient.
@@ -2473,9 +2485,16 @@ Rules:
 2) Prefer dedicated tools over execute_blender_code().
 3) After every major scene change, verify with get_object_info() or get_viewport_screenshot().
 4) Use integrations only if enabled by get_mcp_capabilities().
-5) Use search_blender_docs() only for advanced API lookup (optional, not required).
-6) Keep actions small and deterministic: create/edit/verify/save.
-7) Before finishing, run save_blend_file().
+5) For model retrieval, use strict intent matching:
+    - Specific intent (e.g., "Mercedes", "Optimus Prime") must match candidate title/tags.
+    - If top source fails, fallback to next enabled source; do not stop after one source.
+    - Never silently substitute a different brand/entity for specific requests.
+6) Retrieval provider order for models:
+    - Sketchfab -> Poly Pizza -> PolyHaven -> GitHub Khronos
+    - Use search_asset_sources first, then download_asset.
+7) Use search_blender_docs() only for advanced API lookup (optional, not required).
+8) Keep actions small and deterministic: create/edit/verify/save.
+9) Before finishing, run save_blend_file().
 
 Default order for most tasks:
 - inspect scene
