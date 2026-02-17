@@ -1642,19 +1642,13 @@ class BlenderMCPServer:
         enabled = bpy.context.scene.blendermcp_use_polypizza
         api_key = bpy.context.scene.blendermcp_polypizza_api_key
 
-        if enabled and api_key:
+        if enabled:
+            msg = "Poly Pizza integration is enabled and ready to use."
+            if not api_key:
+                msg += " (Using web scraping mode — no API key needed.)"
             return {
                 "enabled": True,
-                "message": "Poly Pizza integration is enabled and ready to use."
-            }
-        elif enabled and not api_key:
-            return {
-                "enabled": False,
-                "message": """Poly Pizza integration is enabled, but API key is missing. To enable it:
-                            1. In the 3D Viewport, find the BlenderMCP panel in the sidebar (press N if hidden)
-                            2. Keep the 'Use assets from Poly Pizza' checkbox checked
-                            3. Enter your Poly Pizza API Key
-                            4. Restart the connection to Claude"""
+                "message": msg
             }
         else:
             return {
@@ -1662,8 +1656,7 @@ class BlenderMCPServer:
                 "message": """Poly Pizza integration is currently disabled. To enable it:
                             1. In the 3D Viewport, find the BlenderMCP panel in the sidebar (press N if hidden)
                             2. Check the 'Use assets from Poly Pizza' checkbox
-                            3. Enter your Poly Pizza API Key
-                            4. Restart the connection to Claude"""
+                            3. Restart the connection to Claude"""
             }
 
     def _extract_polypizza_results(self, payload):
@@ -1721,26 +1714,42 @@ class BlenderMCPServer:
             if res.status_code != 200:
                 return []
 
-            page_html = res.text
+            page_html = html.unescape(res.text)
 
             # Query tokens for strict relevance filtering
             tokens = [t.lower() for t in re.findall(r'[A-Za-z0-9]+', query or "") if len(t) >= 2]
 
-            # Collect unique ids from /m/<id> links (cap candidates for speed)
-            candidate_ids = []
-            for mid in re.findall(r'/m/([A-Za-z0-9_-]+)', page_html):
-                if mid not in candidate_ids:
-                    candidate_ids.append(mid)
-                if len(candidate_ids) >= max(40, count * 4):
+            # Collect candidate model links and optional visible titles directly from search page.
+            # This avoids expensive per-model fetches and is more resilient to API outages.
+            link_matches = re.findall(
+                r'href=["\"]/m/([A-Za-z0-9_-]+)["\"][^>]*>([^<]{1,200})<',
+                page_html,
+                flags=re.IGNORECASE,
+            )
+
+            candidate_pairs = []
+            seen_ids = set()
+            for mid, title in link_matches:
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                clean_title = (title or "").strip()
+                candidate_pairs.append((mid, clean_title or mid))
+                if len(candidate_pairs) >= max(50, count * 5):
                     break
 
-            scored = []
-            for mid in candidate_ids:
-                meta = self._get_polypizza_model_meta(mid)
-                if not meta:
-                    continue
+            # Fallback if title extraction fails: keep id-only candidates.
+            if not candidate_pairs:
+                for mid in re.findall(r'/m/([A-Za-z0-9_-]+)', page_html):
+                    if mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+                    candidate_pairs.append((mid, mid))
+                    if len(candidate_pairs) >= max(50, count * 5):
+                        break
 
-                name = (meta.get("name") or mid)
+            scored = []
+            for mid, name in candidate_pairs:
                 search_text = f"{name} {mid}".lower()
 
                 # Strict relevance: only keep items that match query tokens
@@ -1758,9 +1767,9 @@ class BlenderMCPServer:
                     "id": mid,
                     "name": name,
                     "triCount": None,
-                    "license": meta.get("license", "Unknown"),
-                    "download": meta.get("download"),
-                    "thumbnail": meta.get("thumbnail"),
+                    "license": "Unknown",
+                    "download": None,
+                    "thumbnail": None,
                 }))
 
             # Best matches first
@@ -1768,28 +1777,28 @@ class BlenderMCPServer:
 
             strict_results = [item for _, item in scored[:count]]
             if strict_results:
+                # Enrich only the top few for performance/reliability.
+                for item in strict_results[:min(5, len(strict_results))]:
+                    meta = self._get_polypizza_model_meta(item.get("id")) or {}
+                    if meta.get("name"):
+                        item["name"] = meta.get("name")
+                    item["license"] = meta.get("license", item.get("license", "Unknown"))
+                    item["download"] = meta.get("download") or item.get("download")
+                    item["thumbnail"] = meta.get("thumbnail") or item.get("thumbnail")
                 return strict_results
 
-            # Smart fallback for broad generic queries only.
-            # This keeps specific queries like "mercedes" strict (empty if no real match),
-            # while still making broad queries like "car" usable.
-            generic_tokens = {
-                "car", "cars", "vehicle", "vehicles", "tree", "trees", "chair", "chairs",
-                "house", "houses", "building", "buildings", "person", "people", "human",
-                "road", "truck", "bus", "bike", "motorcycle", "plane", "boat"
-            }
-            is_generic_query = bool(tokens) and all(t in generic_tokens for t in tokens)
-            if is_generic_query:
+            # If no strict token match, return top page candidates only for multi-token prompts.
+            # Single-token prompts remain strict to avoid unrelated substitutions.
+            if len(tokens) > 1:
                 fallback_items = []
-                for mid in candidate_ids[:count]:
-                    meta = self._get_polypizza_model_meta(mid) or {}
+                for mid, name in candidate_pairs[:count]:
                     fallback_items.append({
                         "id": mid,
-                        "name": meta.get("name", mid),
+                        "name": name,
                         "triCount": None,
-                        "license": meta.get("license", "Unknown"),
-                        "download": meta.get("download"),
-                        "thumbnail": meta.get("thumbnail"),
+                        "license": "Unknown",
+                        "download": None,
+                        "thumbnail": None,
                     })
                 return fallback_items
 
@@ -1895,55 +1904,90 @@ class BlenderMCPServer:
             return None
 
     def search_polypizza_models(self, query, count=20):
-        """Search Poly Pizza models using API key auth."""
+        """Search Poly Pizza models. Uses HTML scraping (primary) and API (if key available)."""
         try:
-            api_key = bpy.context.scene.blendermcp_polypizza_api_key
-            if not api_key:
-                return {"error": "Poly Pizza API key is not configured"}
-
             count = max(1, min(int(count), 50))
 
-            headers = {
-                "x-auth-token": api_key,
-                "User-Agent": "blender-mcp",
-                "Accept": "application/json",
-            }
+            # Intelligent query variants (no hardcoded category word lists).
+            raw_query = (query or "").strip()
+            tokens = [t.lower() for t in re.findall(r'[A-Za-z0-9]+', raw_query) if len(t) >= 2]
+            query_variants = []
+            for cand in [raw_query, " ".join(tokens)]:
+                if cand and cand not in query_variants:
+                    query_variants.append(cand)
 
-            endpoint_candidates = [
-                (f"{POLYPIZZA_API_BASE}/search", {"query": query, "count": count}),
-                (f"{POLYPIZZA_API_BASE}/search", {"q": query, "count": count}),
-                (f"{POLYPIZZA_API_BASE}/models/search", {"query": query, "count": count}),
-                (f"{POLYPIZZA_API_BASE}/models", {"search": query, "count": count}),
-            ]
+            # If the phrase is multi-token, progressively relax to noun-like tail and individual tokens.
+            if len(tokens) > 1:
+                for cand in [tokens[-1], tokens[0]]:
+                    if cand and cand not in query_variants:
+                        query_variants.append(cand)
+                for tok in tokens:
+                    if tok and tok not in query_variants and len(tok) >= 3:
+                        query_variants.append(tok)
 
-            last_error = None
-            for url, params in endpoint_candidates:
-                try:
-                    res = requests.get(url, headers=headers, params=params, timeout=30)
-                    if res.status_code != 200:
-                        last_error = f"HTTP {res.status_code} on {url}"
-                        continue
-                    payload = res.json()
-                    normalized = self._extract_polypizza_results(payload)
-                    if normalized:
-                        return {
-                            "results": normalized[:count],
-                            "count": len(normalized[:count]),
-                        }
-                except Exception as e:
-                    last_error = str(e)
-                    continue
+            # Naive singularization pass (cars -> car) for better recall.
+            for tok in list(tokens):
+                if tok.endswith("s") and len(tok) > 3:
+                    singular = tok[:-1]
+                    if singular not in query_variants:
+                        query_variants.append(singular)
 
-            # Fallback: parse public search page
-            fallback_results = self._search_polypizza_html_fallback(query, count=count)
-            if fallback_results:
-                return {
-                    "results": fallback_results,
-                    "count": len(fallback_results),
-                    "source": "html_fallback",
+            # PRIMARY: HTML scraping (works without API key)
+            for qv in query_variants:
+                fallback_results = self._search_polypizza_html_fallback(qv, count=count)
+                if fallback_results:
+                    return {
+                        "results": fallback_results,
+                        "count": len(fallback_results),
+                        "source": "web_scraping",
+                        "query_used": qv,
+                    }
+
+            # SECONDARY: Try API if key is available (may work if API is restored)
+            api_key = bpy.context.scene.blendermcp_polypizza_api_key
+            if api_key:
+                headers = {
+                    "x-auth-token": api_key,
+                    "User-Agent": "blender-mcp",
+                    "Accept": "application/json",
                 }
 
-            return {"error": f"Poly Pizza search failed: {last_error or 'unknown error'}"}
+                endpoint_candidates = [
+                    (f"{POLYPIZZA_API_BASE}/search", {"query": query, "count": count}),
+                    (f"{POLYPIZZA_API_BASE}/search", {"q": query, "count": count}),
+                    (f"{POLYPIZZA_API_BASE}/models/search", {"query": query, "count": count}),
+                    (f"{POLYPIZZA_API_BASE}/models", {"search": query, "count": count}),
+                ]
+
+                last_error = None
+                for qv in query_variants:
+                    for url, params in endpoint_candidates:
+                        try:
+                            trial_params = dict(params)
+                            if "query" in trial_params:
+                                trial_params["query"] = qv
+                            if "q" in trial_params:
+                                trial_params["q"] = qv
+                            if "search" in trial_params:
+                                trial_params["search"] = qv
+
+                            res = requests.get(url, headers=headers, params=trial_params, timeout=30)
+                            if res.status_code != 200:
+                                last_error = f"HTTP {res.status_code} on {url}"
+                                continue
+                            payload = res.json()
+                            normalized = self._extract_polypizza_results(payload)
+                            if normalized:
+                                return {
+                                    "results": normalized[:count],
+                                    "count": len(normalized[:count]),
+                                    "query_used": qv,
+                                }
+                        except Exception as e:
+                            last_error = str(e)
+                            continue
+
+            return {"error": f"Poly Pizza search found no results for: {raw_query}"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -1951,40 +1995,41 @@ class BlenderMCPServer:
         """Download/import a Poly Pizza model from direct URL or model id lookup."""
         try:
             api_key = bpy.context.scene.blendermcp_polypizza_api_key
-            if not api_key:
-                return {"error": "Poly Pizza API key is not configured"}
 
             headers = {
-                "x-auth-token": api_key,
                 "User-Agent": "blender-mcp",
                 "Accept": "application/json",
             }
+            if api_key:
+                headers["x-auth-token"] = api_key
 
             resolved_url = download_url
             if not resolved_url and model_id:
-                detail_candidates = [
-                    f"{POLYPIZZA_API_BASE}/models/{model_id}",
-                    f"{POLYPIZZA_API_BASE}/model/{model_id}",
-                ]
-                for url in detail_candidates:
-                    try:
-                        res = requests.get(url, headers=headers, timeout=30)
-                        if res.status_code != 200:
-                            continue
-                        payload = res.json()
-                        normalized = self._extract_polypizza_results(payload)
-                        if normalized and normalized[0].get("download"):
-                            resolved_url = normalized[0].get("download")
-                            break
-                        if isinstance(payload, dict):
-                            resolved_url = payload.get("download") or payload.get("downloadUrl") or payload.get("glb")
-                            if resolved_url:
-                                break
-                    except Exception:
-                        continue
+                # Primary: resolve from model page (always works without API key)
+                resolved_url = self._resolve_polypizza_download_from_model_page(model_id)
 
-                if not resolved_url:
-                    resolved_url = self._resolve_polypizza_download_from_model_page(model_id)
+                # Secondary: try API if key is available and page resolution failed
+                if not resolved_url and api_key:
+                    detail_candidates = [
+                        f"{POLYPIZZA_API_BASE}/models/{model_id}",
+                        f"{POLYPIZZA_API_BASE}/model/{model_id}",
+                    ]
+                    for url in detail_candidates:
+                        try:
+                            res = requests.get(url, headers=headers, timeout=30)
+                            if res.status_code != 200:
+                                continue
+                            payload = res.json()
+                            normalized = self._extract_polypizza_results(payload)
+                            if normalized and normalized[0].get("download"):
+                                resolved_url = normalized[0].get("download")
+                                break
+                            if isinstance(payload, dict):
+                                resolved_url = payload.get("download") or payload.get("downloadUrl") or payload.get("glb")
+                                if resolved_url:
+                                    break
+                        except Exception:
+                            continue
 
             # Handle compressed variant URLs gracefully
             if resolved_url and resolved_url.lower().endswith('.glb.br'):
