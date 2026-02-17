@@ -1709,36 +1709,112 @@ class BlenderMCPServer:
         return normalized
 
     def _search_polypizza_html_fallback(self, query, count=20):
-        """Fallback search by parsing public Poly Pizza pages when API endpoints fail."""
+        """Fallback search by parsing public Poly Pizza pages when API endpoints fail.
+
+        Quality goal:
+        - Return query-relevant assets only (avoid unrelated suggestions)
+        - Enrich with model-page metadata (name, thumbnail, download URL when available)
+        """
         try:
             url = f"https://poly.pizza/search/{requests.utils.quote(query)}"
             res = requests.get(url, headers={"User-Agent": "blender-mcp"}, timeout=30)
             if res.status_code != 200:
                 return []
 
-            html = res.text
+            page_html = res.text
 
-            # Collect ids from /m/<id> links.
-            ids = []
-            for mid in re.findall(r'/m/([A-Za-z0-9_-]+)', html):
-                if mid not in ids:
-                    ids.append(mid)
-                if len(ids) >= count:
+            # Query tokens for strict relevance filtering
+            tokens = [t.lower() for t in re.findall(r'[A-Za-z0-9]+', query or "") if len(t) >= 2]
+
+            # Collect unique ids from /m/<id> links (cap candidates for speed)
+            candidate_ids = []
+            for mid in re.findall(r'/m/([A-Za-z0-9_-]+)', page_html):
+                if mid not in candidate_ids:
+                    candidate_ids.append(mid)
+                if len(candidate_ids) >= max(40, count * 4):
                     break
 
-            results = []
-            for mid in ids:
-                results.append({
+            scored = []
+            for mid in candidate_ids:
+                meta = self._get_polypizza_model_meta(mid)
+                if not meta:
+                    continue
+
+                name = (meta.get("name") or mid)
+                search_text = f"{name} {mid}".lower()
+
+                # Strict relevance: only keep items that match query tokens
+                score = 0
+                if tokens:
+                    for tok in tokens:
+                        if tok in search_text:
+                            score += 1
+                    if score == 0:
+                        continue
+                else:
+                    score = 1
+
+                scored.append((score, {
                     "id": mid,
-                    "name": mid,
+                    "name": name,
                     "triCount": None,
-                    "license": "Unknown",
-                    "download": None,
-                    "thumbnail": None,
-                })
-            return results
+                    "license": meta.get("license", "Unknown"),
+                    "download": meta.get("download"),
+                    "thumbnail": meta.get("thumbnail"),
+                }))
+
+            # Best matches first
+            scored.sort(key=lambda x: (-x[0], x[1].get("name", "")))
+            return [item for _, item in scored[:count]]
         except Exception:
             return []
+
+    def _get_polypizza_model_meta(self, model_id):
+        """Get model metadata from model page for fallback search quality."""
+        try:
+            page_url = f"https://poly.pizza/m/{model_id}"
+            res = requests.get(page_url, headers={"User-Agent": "blender-mcp"}, timeout=30)
+            if res.status_code != 200:
+                return None
+
+            page_html = html.unescape(res.text)
+
+            # Try OpenGraph title first
+            name = None
+            m_title = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', page_html, flags=re.IGNORECASE)
+            if m_title:
+                name = m_title.group(1).strip()
+
+            # Optional page title fallback
+            if not name:
+                t = re.search(r'<title>([^<]+)</title>', page_html, flags=re.IGNORECASE)
+                if t:
+                    name = t.group(1).strip()
+
+            download = self._resolve_polypizza_download_from_model_page(model_id)
+
+            # Thumbnail from OpenGraph image if present
+            thumbnail = None
+            m_img = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', page_html, flags=re.IGNORECASE)
+            if m_img:
+                thumbnail = m_img.group(1).strip()
+
+            # Very light license signal if present in page
+            lic = "Unknown"
+            if re.search(r'CC0', page_html, flags=re.IGNORECASE):
+                lic = "CC0"
+            elif re.search(r'CC-BY|Attribution', page_html, flags=re.IGNORECASE):
+                lic = "CC-BY"
+
+            return {
+                "id": model_id,
+                "name": name or model_id,
+                "download": download,
+                "thumbnail": thumbnail,
+                "license": lic,
+            }
+        except Exception:
+            return None
 
     def _resolve_polypizza_download_from_model_page(self, model_id):
         """Resolve direct GLB URL from model page as a fallback."""
@@ -1881,6 +1957,10 @@ class BlenderMCPServer:
 
                 if not resolved_url:
                     resolved_url = self._resolve_polypizza_download_from_model_page(model_id)
+
+            # Handle compressed variant URLs gracefully
+            if resolved_url and resolved_url.lower().endswith('.glb.br'):
+                resolved_url = resolved_url[:-3]
 
             if not resolved_url:
                 return {"error": "No downloadable URL resolved for Poly Pizza model"}
