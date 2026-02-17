@@ -15,6 +15,7 @@ import shutil
 import zipfile
 from bpy.props import IntProperty, BoolProperty
 import io
+import html
 from datetime import datetime
 import hashlib, hmac, base64
 import os.path as osp
@@ -1747,15 +1748,41 @@ class BlenderMCPServer:
             if res.status_code != 200:
                 return None
 
-            html = res.text
+            page_html = html.unescape(res.text)
 
-            # Try absolute GLB URL first
-            match = re.search(r'https://[^\"\']+\\.glb', html, flags=re.IGNORECASE)
+            # Prefer static Poly Pizza binary links directly.
+            static_matches = re.findall(
+                r'https://static\.poly\.pizza/[^\"\'\s>]+\\.glb(?:\\.br)?',
+                page_html,
+                flags=re.IGNORECASE,
+            )
+            if static_matches:
+                # Prefer pure .glb over .glb.br when both exist.
+                for url in static_matches:
+                    if url.lower().endswith('.glb'):
+                        return url
+                # Fallback: strip .br suffix if present.
+                candidate = static_matches[0]
+                if candidate.lower().endswith('.glb.br'):
+                    return candidate[:-3]
+                return candidate
+
+            # Some pages embed viewer URLs with src=<glb_url> query param.
+            src_param_match = re.search(
+                r'src=(https://static\.poly\.pizza/[^&\"\'\s>]+\\.glb)',
+                page_html,
+                flags=re.IGNORECASE,
+            )
+            if src_param_match:
+                return src_param_match.group(1)
+
+            # Generic absolute .glb fallback
+            match = re.search(r'https://[^\"\']+\\.glb', page_html, flags=re.IGNORECASE)
             if match:
                 return match.group(0)
 
-            # Try relative GLB path
-            rel = re.search(r'(/[^\"\']+\\.glb)', html, flags=re.IGNORECASE)
+            # Try relative GLB path fallback
+            rel = re.search(r'(/[^\"\']+\\.glb)', page_html, flags=re.IGNORECASE)
             if rel:
                 return f"https://poly.pizza{rel.group(1)}"
 
