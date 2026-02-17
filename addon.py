@@ -1765,7 +1765,35 @@ class BlenderMCPServer:
 
             # Best matches first
             scored.sort(key=lambda x: (-x[0], x[1].get("name", "")))
-            return [item for _, item in scored[:count]]
+
+            strict_results = [item for _, item in scored[:count]]
+            if strict_results:
+                return strict_results
+
+            # Smart fallback for broad generic queries only.
+            # This keeps specific queries like "mercedes" strict (empty if no real match),
+            # while still making broad queries like "car" usable.
+            generic_tokens = {
+                "car", "cars", "vehicle", "vehicles", "tree", "trees", "chair", "chairs",
+                "house", "houses", "building", "buildings", "person", "people", "human",
+                "road", "truck", "bus", "bike", "motorcycle", "plane", "boat"
+            }
+            is_generic_query = bool(tokens) and all(t in generic_tokens for t in tokens)
+            if is_generic_query:
+                fallback_items = []
+                for mid in candidate_ids[:count]:
+                    meta = self._get_polypizza_model_meta(mid) or {}
+                    fallback_items.append({
+                        "id": mid,
+                        "name": meta.get("name", mid),
+                        "triCount": None,
+                        "license": meta.get("license", "Unknown"),
+                        "download": meta.get("download"),
+                        "thumbnail": meta.get("thumbnail"),
+                    })
+                return fallback_items
+
+            return []
         except Exception:
             return []
 
