@@ -467,12 +467,22 @@ def search_asset_sources(
     """
     Federated search across enabled internet asset sources with normalized output.
 
+    Uses cascading quality-priority order for realistic, high-quality 3D models:
+    1. Sketchfab — highest quality, diverse, realistic models with materials
+    2. PolyHaven — high-quality CC0 models and textures
+    3. GitHub Khronos — reference-quality glTF sample models
+    4. Poly Pizza — low-poly/stylized models (last resort)
+
+    When higher-priority providers return enough results, lower-priority ones
+    are skipped for efficiency. If you explicitly pass providers, all requested
+    providers are always queried (no cascade skipping).
+
     Parameters:
     - query: search text (e.g., "rusted metal barrel")
     - category: model | texture | hdri
     - max_results: max returned items
     - license_filter: all | cc0 | cc-by
-    - providers: optional list from ["polyhaven", "sketchfab", "polypizza", "github_khronos"]
+    - providers: optional list from ["sketchfab", "polyhaven", "github_khronos", "polypizza"]
     """
     try:
         blender: Optional[BlenderConnection] = None
@@ -486,13 +496,41 @@ def search_asset_sources(
         category = (category or "model").lower()
         max_results = min(max(1, max_results), 50)
 
-        requested = [p.lower() for p in (providers or ["polyhaven", "sketchfab", "polypizza", "github_khronos"])]
+        # Quality-priority order: realistic/detailed first, low-poly last
+        DEFAULT_PROVIDER_ORDER = ["sketchfab", "polyhaven", "github_khronos", "polypizza"]
+        user_explicit = providers is not None
+        requested = [p.lower() for p in (providers or DEFAULT_PROVIDER_ORDER)]
+
         all_candidates: List[Dict[str, Any]] = []
         used_providers: List[str] = []
 
         variants = _query_variants(query)
 
-        if "polyhaven" in requested:
+        def _have_enough_results() -> bool:
+            """Check if we already have enough high-quality relevant results to
+            skip lower-priority providers. Only applies to default cascade."""
+            if user_explicit:
+                return False  # Always query all user-requested providers
+            relevant = [c for c in all_candidates
+                        if _relevance_score(c, query) > 0]
+            return len(relevant) >= max_results
+
+        # ── 1. SKETCHFAB (highest priority — realistic, detailed models) ──────
+        if "sketchfab" in requested and category == "model":
+            try:
+                sk = _blender().send_command("search_sketchfab_models", {
+                    "query": query,
+                    "count": max_results,
+                    "downloadable": True,
+                })
+                if isinstance(sk, dict) and isinstance(sk.get("results"), list):
+                    used_providers.append("sketchfab")
+                    all_candidates.extend(_normalize_sketchfab_assets(sk.get("results", [])))
+            except Exception:
+                pass
+
+        # ── 2. POLYHAVEN (high-quality CC0 models/textures/HDRIs) ─────────────
+        if "polyhaven" in requested and not _have_enough_results():
             try:
                 poly_added = False
                 for qv in variants:
@@ -507,20 +545,37 @@ def search_asset_sources(
             except Exception:
                 pass
 
-        if "sketchfab" in requested and category == "model":
+        # ── 3. GITHUB KHRONOS (reference glTF sample models) ─────────────────
+        if "github_khronos" in requested and category == "model" and not _have_enough_results():
             try:
-                sk = _blender().send_command("search_sketchfab_models", {
-                    "query": query,
-                    "count": max_results,
-                    "downloadable": True,
-                })
-                if isinstance(sk, dict) and isinstance(sk.get("results"), list):
-                    used_providers.append("sketchfab")
-                    all_candidates.extend(_normalize_sketchfab_assets(sk.get("results", [])))
+                tree = _github_api_json("https://api.github.com/repos/KhronosGroup/glTF-Sample-Assets/git/trees/main?recursive=1")
+                variants_l = [v.lower().strip() for v in variants if v.strip()]
+                khronos_items = []
+                for node in tree.get("tree", []):
+                    path = node.get("path", "")
+                    if not path.lower().endswith((".glb", ".gltf")):
+                        continue
+                    if variants_l and not any(v in path.lower() for v in variants_l):
+                        continue
+                    raw = _github_raw_url("KhronosGroup/glTF-Sample-Assets", path, "main")
+                    khronos_items.append({
+                        "source": "github_khronos",
+                        "asset_id": raw,
+                        "title": path.split("/")[-1],
+                        "category": "model",
+                        "tags": ["khronos", "gltf", "sample"],
+                        "license_label": "Repository license (see source)",
+                        "download_url": raw,
+                        "source_url": f"https://github.com/KhronosGroup/glTF-Sample-Assets/blob/main/{path}",
+                    })
+                if khronos_items:
+                    used_providers.append("github_khronos")
+                    all_candidates.extend(khronos_items)
             except Exception:
                 pass
 
-        if "polypizza" in requested and category == "model":
+        # ── 4. POLYPIZZA (last resort — low-poly/stylized models) ────────────
+        if "polypizza" in requested and category == "model" and not _have_enough_results():
             try:
                 pz_items: List[Dict[str, Any]] = []
                 seen_ids = set()
@@ -561,31 +616,6 @@ def search_asset_sources(
             except Exception:
                 pass
 
-        if "github_khronos" in requested and category == "model":
-            try:
-                tree = _github_api_json("https://api.github.com/repos/KhronosGroup/glTF-Sample-Assets/git/trees/main?recursive=1")
-                used_providers.append("github_khronos")
-                variants_l = [v.lower().strip() for v in variants if v.strip()]
-                for node in tree.get("tree", []):
-                    path = node.get("path", "")
-                    if not path.lower().endswith((".glb", ".gltf")):
-                        continue
-                    if variants_l and not any(v in path.lower() for v in variants_l):
-                        continue
-                    raw = _github_raw_url("KhronosGroup/glTF-Sample-Assets", path, "main")
-                    all_candidates.append({
-                        "source": "github_khronos",
-                        "asset_id": raw,
-                        "title": path.split("/")[-1],
-                        "category": "model",
-                        "tags": ["khronos", "gltf", "sample"],
-                        "license_label": "Repository license (see source)",
-                        "download_url": raw,
-                        "source_url": f"https://github.com/KhronosGroup/glTF-Sample-Assets/blob/main/{path}",
-                    })
-            except Exception:
-                pass
-
         filtered = [
             item for item in all_candidates
             if _license_passes_filter(item.get("license_label", ""), license_filter)
@@ -601,7 +631,8 @@ def search_asset_sources(
                 filtered = strict
 
         if category == "model":
-            source_rank = {"sketchfab": 0, "polypizza": 1, "github_khronos": 2, "polyhaven": 3}
+            # Quality priority: Sketchfab > PolyHaven > Khronos > PolyPizza
+            source_rank = {"sketchfab": 0, "polyhaven": 1, "github_khronos": 2, "polypizza": 3}
             filtered.sort(key=lambda x: (
                 -(x.get("relevance_score") or 0),
                 source_rank.get(x.get("source"), 9),
