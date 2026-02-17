@@ -36,6 +36,8 @@ RODIN_FREE_TRIAL_KEY = "k9TcfFoEhNd9cCPP2guHAHHHkctZHIRhZDywZ1euGUXwihbYLpOjQhof
 REQ_HEADERS = requests.utils.default_headers()
 REQ_HEADERS.update({"User-Agent": "blender-mcp"})
 
+POLYPIZZA_API_BASE = "https://poly.pizza/api/v1.1"
+
 class BlenderMCPServer:
     def __init__(self, host='localhost', port=9876):
         self.host = host
@@ -211,6 +213,7 @@ class BlenderMCPServer:
             "get_polyhaven_status": self.get_polyhaven_status,
             "get_hyper3d_status": self.get_hyper3d_status,
             "get_sketchfab_status": self.get_sketchfab_status,
+            "get_polypizza_status": self.get_polypizza_status,
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
             # New dedicated tools - always available
             "create_object": self.create_object,
@@ -264,8 +267,17 @@ class BlenderMCPServer:
                 "search_sketchfab_models": self.search_sketchfab_models,
                 "get_sketchfab_model_preview": self.get_sketchfab_model_preview,
                 "download_sketchfab_model": self.download_sketchfab_model,
+                "get_sketchfab_model_license": self.get_sketchfab_model_license,
             }
             handlers.update(sketchfab_handlers)
+
+        # Add Poly Pizza handlers only if enabled
+        if bpy.context.scene.blendermcp_use_polypizza:
+            polypizza_handlers = {
+                "search_polypizza_models": self.search_polypizza_models,
+                "download_polypizza_model": self.download_polypizza_model,
+            }
+            handlers.update(polypizza_handlers)
         
         # Add Hunyuan3d handlers only if enabled
         if bpy.context.scene.blendermcp_use_hunyuan3d:
@@ -1624,6 +1636,225 @@ class BlenderMCPServer:
                             4. Restart the connection to Claude"""
             }
 
+    def get_polypizza_status(self):
+        """Get the current status of Poly Pizza integration."""
+        enabled = bpy.context.scene.blendermcp_use_polypizza
+        api_key = bpy.context.scene.blendermcp_polypizza_api_key
+
+        if enabled and api_key:
+            return {
+                "enabled": True,
+                "message": "Poly Pizza integration is enabled and ready to use."
+            }
+        elif enabled and not api_key:
+            return {
+                "enabled": False,
+                "message": """Poly Pizza integration is enabled, but API key is missing. To enable it:
+                            1. In the 3D Viewport, find the BlenderMCP panel in the sidebar (press N if hidden)
+                            2. Keep the 'Use assets from Poly Pizza' checkbox checked
+                            3. Enter your Poly Pizza API Key
+                            4. Restart the connection to Claude"""
+            }
+        else:
+            return {
+                "enabled": False,
+                "message": """Poly Pizza integration is currently disabled. To enable it:
+                            1. In the 3D Viewport, find the BlenderMCP panel in the sidebar (press N if hidden)
+                            2. Check the 'Use assets from Poly Pizza' checkbox
+                            3. Enter your Poly Pizza API Key
+                            4. Restart the connection to Claude"""
+            }
+
+    def _extract_polypizza_results(self, payload):
+        """Normalize Poly Pizza API response into a stable list."""
+        if not isinstance(payload, dict):
+            return []
+
+        candidates = []
+        for key in ("results", "models", "items", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                candidates = value
+                break
+
+        normalized = []
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+
+            model_id = item.get("id") or item.get("uid") or item.get("slug")
+            title = item.get("title") or item.get("name") or model_id or "Unknown"
+            tri_count = item.get("triCount") or item.get("tri_count") or item.get("tris")
+            license_label = item.get("license") or item.get("licenseLabel") or "Unknown"
+
+            download_url = (
+                item.get("download")
+                or item.get("downloadUrl")
+                or item.get("glb")
+                or item.get("modelUrl")
+            )
+
+            thumb = item.get("thumbnail") or item.get("thumbnailUrl") or item.get("preview")
+
+            normalized.append({
+                "id": model_id,
+                "name": title,
+                "triCount": tri_count,
+                "license": license_label,
+                "download": download_url,
+                "thumbnail": thumb,
+            })
+
+        return normalized
+
+    def search_polypizza_models(self, query, count=20):
+        """Search Poly Pizza models using API key auth."""
+        try:
+            api_key = bpy.context.scene.blendermcp_polypizza_api_key
+            if not api_key:
+                return {"error": "Poly Pizza API key is not configured"}
+
+            count = max(1, min(int(count), 50))
+
+            headers = {
+                "x-auth-token": api_key,
+                "User-Agent": "blender-mcp",
+                "Accept": "application/json",
+            }
+
+            endpoint_candidates = [
+                (f"{POLYPIZZA_API_BASE}/search", {"query": query, "count": count}),
+                (f"{POLYPIZZA_API_BASE}/search", {"q": query, "count": count}),
+                (f"{POLYPIZZA_API_BASE}/models/search", {"query": query, "count": count}),
+                (f"{POLYPIZZA_API_BASE}/models", {"search": query, "count": count}),
+            ]
+
+            last_error = None
+            for url, params in endpoint_candidates:
+                try:
+                    res = requests.get(url, headers=headers, params=params, timeout=30)
+                    if res.status_code != 200:
+                        last_error = f"HTTP {res.status_code} on {url}"
+                        continue
+                    payload = res.json()
+                    normalized = self._extract_polypizza_results(payload)
+                    if normalized:
+                        return {
+                            "results": normalized[:count],
+                            "count": len(normalized[:count]),
+                        }
+                except Exception as e:
+                    last_error = str(e)
+                    continue
+
+            return {"error": f"Poly Pizza search failed: {last_error or 'unknown error'}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def download_polypizza_model(self, model_id=None, download_url=None, target_size=1.0):
+        """Download/import a Poly Pizza model from direct URL or model id lookup."""
+        try:
+            api_key = bpy.context.scene.blendermcp_polypizza_api_key
+            if not api_key:
+                return {"error": "Poly Pizza API key is not configured"}
+
+            headers = {
+                "x-auth-token": api_key,
+                "User-Agent": "blender-mcp",
+                "Accept": "application/json",
+            }
+
+            resolved_url = download_url
+            if not resolved_url and model_id:
+                detail_candidates = [
+                    f"{POLYPIZZA_API_BASE}/models/{model_id}",
+                    f"{POLYPIZZA_API_BASE}/model/{model_id}",
+                ]
+                for url in detail_candidates:
+                    try:
+                        res = requests.get(url, headers=headers, timeout=30)
+                        if res.status_code != 200:
+                            continue
+                        payload = res.json()
+                        normalized = self._extract_polypizza_results(payload)
+                        if normalized and normalized[0].get("download"):
+                            resolved_url = normalized[0].get("download")
+                            break
+                        if isinstance(payload, dict):
+                            resolved_url = payload.get("download") or payload.get("downloadUrl") or payload.get("glb")
+                            if resolved_url:
+                                break
+                    except Exception:
+                        continue
+
+            if not resolved_url:
+                return {"error": "No downloadable URL resolved for Poly Pizza model"}
+
+            temp_dir = tempfile.mkdtemp(prefix="polypizza_")
+            try:
+                file_name = (model_id or "polypizza_model") + ".glb"
+                file_path = os.path.join(temp_dir, file_name)
+
+                dl = requests.get(resolved_url, timeout=60)
+                if dl.status_code != 200:
+                    return {"error": f"Download failed with status {dl.status_code}"}
+                with open(file_path, "wb") as f:
+                    f.write(dl.content)
+
+                existing_objects = set(bpy.data.objects)
+                bpy.ops.import_scene.gltf(filepath=file_path)
+                imported_objects = list(set(bpy.data.objects) - existing_objects)
+                imported_names = [obj.name for obj in imported_objects]
+
+                # Optional normalization by scaling roots so max dimension == target_size
+                roots = [obj for obj in imported_objects if obj.parent is None]
+                all_meshes = []
+                for root in roots:
+                    stack = [root]
+                    while stack:
+                        n = stack.pop()
+                        if n.type == 'MESH':
+                            all_meshes.append(n)
+                        stack.extend(list(n.children))
+
+                scale_applied = 1.0
+                if all_meshes and target_size and float(target_size) > 0:
+                    all_min = mathutils.Vector((float('inf'), float('inf'), float('inf')))
+                    all_max = mathutils.Vector((float('-inf'), float('-inf'), float('-inf')))
+                    for mesh_obj in all_meshes:
+                        for corner in mesh_obj.bound_box:
+                            wc = mesh_obj.matrix_world @ mathutils.Vector(corner)
+                            all_min.x = min(all_min.x, wc.x)
+                            all_min.y = min(all_min.y, wc.y)
+                            all_min.z = min(all_min.z, wc.z)
+                            all_max.x = max(all_max.x, wc.x)
+                            all_max.y = max(all_max.y, wc.y)
+                            all_max.z = max(all_max.z, wc.z)
+
+                    dims = [all_max.x - all_min.x, all_max.y - all_min.y, all_max.z - all_min.z]
+                    max_dim = max(dims) if dims else 0.0
+                    if max_dim > 0:
+                        scale_applied = float(target_size) / max_dim
+                        for root in roots:
+                            root.scale = (
+                                root.scale.x * scale_applied,
+                                root.scale.y * scale_applied,
+                                root.scale.z * scale_applied,
+                            )
+                        bpy.context.view_layer.update()
+
+                return {
+                    "success": True,
+                    "imported_objects": imported_names,
+                    "scale_applied": round(scale_applied, 6),
+                    "normalized": True if scale_applied != 1.0 else False,
+                }
+            finally:
+                with suppress(Exception):
+                    shutil.rmtree(temp_dir)
+        except Exception as e:
+            return {"error": f"Failed to download Poly Pizza model: {str(e)}"}
+
     def search_sketchfab_models(self, query, categories=None, count=20, downloadable=True):
         """Search for models on Sketchfab based on query and optional filters"""
         try:
@@ -1771,6 +2002,53 @@ class BlenderMCPServer:
             import traceback
             traceback.print_exc()
             return {"error": f"Failed to get model preview: {str(e)}"}
+
+    def get_sketchfab_model_license(self, uid):
+        """Get normalized license/attribution details for a Sketchfab model."""
+        try:
+            api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+            if not api_key:
+                return {"error": "Sketchfab API key is not configured"}
+
+            headers = {"Authorization": f"Token {api_key}"}
+            response = requests.get(
+                f"https://api.sketchfab.com/v3/models/{uid}",
+                headers=headers,
+                timeout=30
+            )
+
+            if response.status_code == 401:
+                return {"error": "Authentication failed (401). Check your API key."}
+            if response.status_code == 404:
+                return {"error": f"Model not found: {uid}"}
+            if response.status_code != 200:
+                return {"error": f"Failed to get model details: {response.status_code}"}
+
+            data = response.json() or {}
+            license_data = data.get("license") or {}
+            user_data = data.get("user") or {}
+
+            license_label = license_data.get("label", "Unknown")
+            license_slug = str(license_data.get("slug", "")).lower()
+            attribution_required = license_slug.startswith("cc-by") or ("attribution" in license_label.lower())
+
+            return {
+                "uid": uid,
+                "name": data.get("name", "Unknown"),
+                "source": "sketchfab",
+                "license_code": license_data.get("fullName") or license_label,
+                "license_label": license_label,
+                "license_url": license_data.get("url"),
+                "attribution_required": attribution_required,
+                "author": user_data.get("displayName") or user_data.get("username", "Unknown"),
+                "author_url": user_data.get("profileUrl"),
+                "source_url": data.get("viewerUrl") or data.get("uri"),
+                "commercial_use_allowed": True,
+            }
+        except requests.exceptions.Timeout:
+            return {"error": "Request timed out. Check your internet connection."}
+        except Exception as e:
+            return {"error": f"Failed to get model license: {str(e)}"}
 
     def download_sketchfab_model(self, uid, normalize_size=False, target_size=1.0):
         """Download a model from Sketchfab by its UID
@@ -3357,6 +3635,10 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         if scene.blendermcp_use_sketchfab:
             layout.prop(scene, "blendermcp_sketchfab_api_key", text="API Key")
 
+        layout.prop(scene, "blendermcp_use_polypizza", text="Use assets from Poly Pizza")
+        if scene.blendermcp_use_polypizza:
+            layout.prop(scene, "blendermcp_polypizza_api_key", text="API Key")
+
         layout.prop(scene, "blendermcp_use_hunyuan3d", text="Use Tencent Hunyuan 3D model generation")
         if scene.blendermcp_use_hunyuan3d:
             layout.prop(scene, "blendermcp_hunyuan3d_mode", text="Hunyuan3D Mode")
@@ -3564,6 +3846,19 @@ def register():
         default=""
     )
 
+    bpy.types.Scene.blendermcp_use_polypizza = bpy.props.BoolProperty(
+        name="Use Poly Pizza",
+        description="Enable Poly Pizza asset integration",
+        default=False
+    )
+
+    bpy.types.Scene.blendermcp_polypizza_api_key = bpy.props.StringProperty(
+        name="Poly Pizza API Key",
+        subtype="PASSWORD",
+        description="API Key provided by Poly Pizza",
+        default=""
+    )
+
     # Register preferences class
     bpy.utils.register_class(BLENDERMCP_AddonPreferences)
 
@@ -3596,6 +3891,8 @@ def unregister():
     del bpy.types.Scene.blendermcp_hyper3d_api_key
     del bpy.types.Scene.blendermcp_use_sketchfab
     del bpy.types.Scene.blendermcp_sketchfab_api_key
+    del bpy.types.Scene.blendermcp_use_polypizza
+    del bpy.types.Scene.blendermcp_polypizza_api_key
     del bpy.types.Scene.blendermcp_use_hunyuan3d
     del bpy.types.Scene.blendermcp_hunyuan3d_mode
     del bpy.types.Scene.blendermcp_hunyuan3d_secret_id

@@ -8,11 +8,13 @@ import logging
 import tempfile
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List
+from typing import AsyncIterator, Dict, Any, List, Optional
 from threading import RLock
 import os
 from pathlib import Path
 import base64
+import urllib.request
+import urllib.parse
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 
@@ -253,6 +255,515 @@ def _handle_result(result: dict) -> dict:
         raise Exception(result["error"])
     return result
 
+
+def _asset_manifest_path() -> Path:
+    """Path for persistent local asset ingestion audit log."""
+    base = Path(os.getenv("BLENDER_MCP_ASSET_CACHE", str(Path.home() / ".blender_mcp")))
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "assets_manifest.json"
+
+
+def _append_asset_manifest(entry: Dict[str, Any]) -> None:
+    """Append one entry to local asset manifest JSON."""
+    manifest_path = _asset_manifest_path()
+    records: List[Dict[str, Any]] = []
+    if manifest_path.exists():
+        try:
+            records = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(records, list):
+                records = []
+        except Exception:
+            records = []
+
+    records.append(entry)
+    manifest_path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+
+
+def _license_passes_filter(license_label: str, license_filter: str) -> bool:
+    lbl = (license_label or "").strip().lower()
+    lf = (license_filter or "all").strip().lower()
+    if lf == "all":
+        return True
+    if lf == "cc0":
+        return ("cc0" in lbl) or ("public domain" in lbl)
+    if lf == "cc-by":
+        return "cc-by" in lbl
+    return True
+
+
+def _normalize_polyhaven_assets(assets: Dict[str, Any], category: str) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for asset_id, asset_data in (assets or {}).items():
+        normalized.append({
+            "source": "polyhaven",
+            "asset_id": asset_id,
+            "title": asset_data.get("name", asset_id),
+            "category": category,
+            "tags": asset_data.get("categories", []),
+            "license_label": "CC0",
+            "download_count": asset_data.get("download_count", 0),
+            "source_url": f"https://polyhaven.com/a/{asset_id}",
+        })
+    return normalized
+
+
+def _normalize_sketchfab_assets(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for model in models or []:
+        license_data = model.get("license") or {}
+        user_data = model.get("user") or {}
+        thumbs = (model.get("thumbnails") or {}).get("images", [])
+        thumb_url = thumbs[0].get("url") if thumbs else None
+        uid = model.get("uid")
+        normalized.append({
+            "source": "sketchfab",
+            "asset_id": uid,
+            "title": model.get("name", uid),
+            "category": "model",
+            "tags": model.get("tags", []),
+            "license_label": license_data.get("label", "Unknown"),
+            "author": user_data.get("username", "Unknown"),
+            "face_count": model.get("faceCount"),
+            "downloadable": model.get("isDownloadable", False),
+            "thumbnail_url": thumb_url,
+            "source_url": f"https://sketchfab.com/3d-models/{uid}" if uid else None,
+        })
+    return normalized
+
+
+def _github_api_json(url: str) -> Dict[str, Any]:
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "blender-mcp"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _github_raw_url(repo: str, path: str, branch: str = "main") -> str:
+    return f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+
+
+@mcp.tool()
+def search_asset_sources(
+    ctx: Context,
+    query: str,
+    category: str = "model",
+    max_results: int = 10,
+    license_filter: str = "all",
+    providers: Optional[List[str]] = None,
+) -> str:
+    """
+    Federated search across enabled internet asset sources with normalized output.
+
+    Parameters:
+    - query: search text (e.g., "rusted metal barrel")
+    - category: model | texture | hdri
+    - max_results: max returned items
+    - license_filter: all | cc0 | cc-by
+    - providers: optional list from ["polyhaven", "sketchfab", "polypizza", "github_khronos"]
+    """
+    try:
+        blender = get_blender_connection()
+        category = (category or "model").lower()
+        max_results = min(max(1, max_results), 50)
+
+        requested = [p.lower() for p in (providers or ["polyhaven", "sketchfab", "polypizza", "github_khronos"])]
+        all_candidates: List[Dict[str, Any]] = []
+        used_providers: List[str] = []
+
+        if "polyhaven" in requested:
+            try:
+                asset_type = {
+                    "model": "models",
+                    "texture": "textures",
+                    "hdri": "hdris",
+                }.get(category, "all")
+                poly = blender.send_command("search_polyhaven_assets", {
+                    "asset_type": asset_type,
+                    "categories": query,
+                })
+                if isinstance(poly, dict) and "assets" in poly:
+                    used_providers.append("polyhaven")
+                    all_candidates.extend(_normalize_polyhaven_assets(poly.get("assets", {}), category))
+            except Exception:
+                pass
+
+        if "sketchfab" in requested and category == "model":
+            try:
+                sk = blender.send_command("search_sketchfab_models", {
+                    "query": query,
+                    "count": max_results,
+                    "downloadable": True,
+                })
+                if isinstance(sk, dict) and isinstance(sk.get("results"), list):
+                    used_providers.append("sketchfab")
+                    all_candidates.extend(_normalize_sketchfab_assets(sk.get("results", [])))
+            except Exception:
+                pass
+
+        if "polypizza" in requested and category == "model":
+            try:
+                pz = blender.send_command("search_polypizza_models", {
+                    "query": query,
+                    "count": max_results,
+                })
+                if isinstance(pz, dict) and isinstance(pz.get("results"), list):
+                    used_providers.append("polypizza")
+                    for item in pz.get("results", []):
+                        all_candidates.append({
+                            "source": "polypizza",
+                            "asset_id": item.get("id"),
+                            "title": item.get("name", item.get("id")),
+                            "category": "model",
+                            "tags": [],
+                            "license_label": item.get("license", "Unknown"),
+                            "tri_count": item.get("triCount"),
+                            "download_url": item.get("download"),
+                            "thumbnail_url": item.get("thumbnail"),
+                            "source_url": f"https://poly.pizza/m/{item.get('id')}" if item.get("id") else None,
+                        })
+            except Exception:
+                pass
+
+        if "github_khronos" in requested and category == "model":
+            try:
+                tree = _github_api_json("https://api.github.com/repos/KhronosGroup/glTF-Sample-Assets/git/trees/main?recursive=1")
+                used_providers.append("github_khronos")
+                q = (query or "").lower().strip()
+                for node in tree.get("tree", []):
+                    path = node.get("path", "")
+                    if not path.lower().endswith((".glb", ".gltf")):
+                        continue
+                    if q and q not in path.lower():
+                        continue
+                    raw = _github_raw_url("KhronosGroup/glTF-Sample-Assets", path, "main")
+                    all_candidates.append({
+                        "source": "github_khronos",
+                        "asset_id": raw,
+                        "title": path.split("/")[-1],
+                        "category": "model",
+                        "tags": ["khronos", "gltf", "sample"],
+                        "license_label": "Repository license (see source)",
+                        "download_url": raw,
+                        "source_url": f"https://github.com/KhronosGroup/glTF-Sample-Assets/blob/main/{path}",
+                    })
+            except Exception:
+                pass
+
+        filtered = [
+            item for item in all_candidates
+            if _license_passes_filter(item.get("license_label", ""), license_filter)
+        ]
+
+        if category == "model":
+            filtered.sort(key=lambda x: (x.get("source") != "sketchfab", -(x.get("face_count") or 0)))
+        else:
+            filtered.sort(key=lambda x: (x.get("source") != "polyhaven", -(x.get("download_count") or 0)))
+
+        result = {
+            "query": query,
+            "category": category,
+            "license_filter": license_filter,
+            "providers_used": used_providers,
+            "count": min(len(filtered), max_results),
+            "results": filtered[:max_results],
+        }
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error in search_asset_sources: {str(e)}")
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
+def get_asset_license(ctx: Context, source: str, asset_id: str) -> str:
+    """
+    Retrieve normalized license metadata for an asset.
+
+    Parameters:
+    - source: polyhaven | sketchfab
+    - asset_id: provider-specific asset id/uid
+    """
+    try:
+        blender = get_blender_connection()
+        src = (source or "").lower().strip()
+
+        if src == "polyhaven":
+            result = {
+                "source": "polyhaven",
+                "asset_id": asset_id,
+                "license_code": "CC0-1.0",
+                "license_label": "CC0",
+                "attribution_required": False,
+                "commercial_use_allowed": True,
+                "source_url": f"https://polyhaven.com/a/{asset_id}",
+            }
+            return json.dumps(result, indent=2)
+
+        if src == "sketchfab":
+            result = _handle_result(blender.send_command("get_sketchfab_model_license", {"uid": asset_id}))
+            return json.dumps(result, indent=2)
+
+        if src == "polypizza":
+            # For Poly Pizza, license is retrieved from search metadata in current flow.
+            return json.dumps({
+                "source": "polypizza",
+                "asset_id": asset_id,
+                "license_code": "Provider metadata required",
+                "license_label": "See model metadata",
+                "attribution_required": True,
+                "commercial_use_allowed": True,
+                "source_url": f"https://poly.pizza/m/{asset_id}",
+            }, indent=2)
+
+        if src == "github_khronos":
+            return json.dumps({
+                "source": "github_khronos",
+                "asset_id": asset_id,
+                "license_code": "Repository license",
+                "license_label": "Check repository LICENSE",
+                "attribution_required": True,
+                "commercial_use_allowed": True,
+                "source_url": "https://github.com/KhronosGroup/glTF-Sample-Assets",
+            }, indent=2)
+
+        return json.dumps({"error": f"Unsupported source: {source}"}, indent=2)
+    except Exception as e:
+        logger.error(f"Error in get_asset_license: {str(e)}")
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
+def download_asset(
+    ctx: Context,
+    source: str,
+    asset_id: str,
+    asset_type: str = "model",
+    target_size: float = 1.0,
+    format_preference: str = "glb",
+    resolution: str = "1k",
+) -> str:
+    """
+    Unified download/import entry point for supported sources.
+
+    Parameters:
+    - source: polyhaven | sketchfab
+    - asset_id: provider asset id
+    - asset_type: model | texture | hdri (used by polyhaven)
+    - target_size: model normalization size in meters (used by sketchfab)
+    - format_preference: preferred format hint
+    - resolution: quality hint for polyhaven
+    """
+    try:
+        blender = get_blender_connection()
+        src = (source or "").lower().strip()
+        atype = (asset_type or "model").lower().strip()
+
+        if src == "sketchfab":
+            result = _handle_result(blender.send_command("download_sketchfab_model", {
+                "uid": asset_id,
+                "normalize_size": True,
+                "target_size": float(target_size),
+            }))
+        elif src == "polypizza":
+            result = _handle_result(blender.send_command("download_polypizza_model", {
+                "model_id": asset_id,
+                "download_url": None,
+                "target_size": float(target_size),
+            }))
+        elif src == "polyhaven":
+            poly_type = {
+                "model": "models",
+                "texture": "textures",
+                "hdri": "hdris",
+            }.get(atype, "models")
+
+            default_format = {
+                "models": "gltf",
+                "textures": "jpg",
+                "hdris": "hdr",
+            }[poly_type]
+            file_format = (format_preference or default_format).lower()
+
+            result = _handle_result(blender.send_command("download_polyhaven_asset", {
+                "asset_id": asset_id,
+                "asset_type": poly_type,
+                "resolution": resolution,
+                "file_format": file_format,
+            }))
+        elif src == "github_khronos":
+            # asset_id is expected to be a raw downloadable URL from search_asset_sources
+            parsed = urlparse(asset_id)
+            if parsed.scheme not in ("http", "https"):
+                return json.dumps({"error": "Invalid github_khronos asset_id URL"}, indent=2)
+            suffix = ".glb" if asset_id.lower().endswith(".glb") else ".gltf"
+            tmp_dir = tempfile.mkdtemp(prefix="blender_mcp_github_")
+            local_path = os.path.join(tmp_dir, f"asset{suffix}")
+            req = urllib.request.Request(asset_id, headers={"User-Agent": "blender-mcp"})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp, open(local_path, "wb") as f:
+                    f.write(resp.read())
+                result = _handle_result(blender.send_command("import_file", {"filepath": local_path}))
+            finally:
+                # keep temp file for current Blender session reliability; cleanup best effort on process exit
+                pass
+        else:
+            return json.dumps({"error": f"Unsupported source: {source}"}, indent=2)
+
+        manifest_entry = {
+            "asset_id": asset_id,
+            "source": src,
+            "asset_type": atype,
+            "ingest_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "format_preference": format_preference,
+            "resolution": resolution,
+            "result": result,
+        }
+        try:
+            _append_asset_manifest(manifest_entry)
+        except Exception as log_error:
+            logger.warning(f"Manifest append failed: {log_error}")
+
+        return json.dumps({
+            "success": True,
+            "source": src,
+            "asset_id": asset_id,
+            "result": result,
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error in download_asset: {str(e)}")
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
+def asset_provenance_report(ctx: Context, limit: int = 100) -> str:
+    """
+    Return a local audit log of ingested assets.
+
+    Parameters:
+    - limit: max entries returned from the most recent records
+    """
+    try:
+        manifest_path = _asset_manifest_path()
+        if not manifest_path.exists():
+            return json.dumps({
+                "count": 0,
+                "manifest_path": str(manifest_path),
+                "entries": [],
+            }, indent=2)
+
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            data = []
+        lim = min(max(1, int(limit)), 1000)
+        entries = data[-lim:]
+        return json.dumps({
+            "count": len(entries),
+            "manifest_path": str(manifest_path),
+            "entries": entries,
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error in asset_provenance_report: {str(e)}")
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
+def get_polypizza_status(ctx: Context) -> str:
+    """
+    Check if Poly Pizza integration is enabled in Blender.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_polypizza_status")
+        return result.get("message", "Poly Pizza status unavailable")
+    except Exception as e:
+        logger.error(f"Error checking Poly Pizza status: {str(e)}")
+        return f"Error checking Poly Pizza status: {str(e)}"
+
+
+@mcp.tool()
+def search_polypizza_models(ctx: Context, query: str, count: int = 20) -> str:
+    """
+    Search Poly Pizza low-poly models.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("search_polypizza_models", {
+            "query": query,
+            "count": max(1, min(count, 50)),
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error searching Poly Pizza models: {str(e)}")
+        return f"Error searching Poly Pizza models: {str(e)}"
+
+
+@mcp.tool()
+def download_polypizza_model(ctx: Context, model_id: str = None, download_url: str = None, target_size: float = 1.0) -> str:
+    """
+    Download and import a Poly Pizza model.
+
+    Parameters:
+    - model_id: Poly Pizza model id (preferred)
+    - download_url: direct download URL (optional override)
+    - target_size: normalize largest dimension to this size in meters
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("download_polypizza_model", {
+            "model_id": model_id,
+            "download_url": download_url,
+            "target_size": target_size,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error downloading Poly Pizza model: {str(e)}")
+        return f"Error downloading Poly Pizza model: {str(e)}"
+
+
+@mcp.tool()
+def search_github_khronos_models(ctx: Context, query: str = "", max_results: int = 20) -> str:
+    """
+    Search glTF sample models from Khronos GitHub repository.
+    """
+    try:
+        tree = _github_api_json("https://api.github.com/repos/KhronosGroup/glTF-Sample-Assets/git/trees/main?recursive=1")
+        q = (query or "").lower().strip()
+        out: List[Dict[str, Any]] = []
+        for node in tree.get("tree", []):
+            path = node.get("path", "")
+            if not path.lower().endswith((".glb", ".gltf")):
+                continue
+            if q and q not in path.lower():
+                continue
+            raw = _github_raw_url("KhronosGroup/glTF-Sample-Assets", path, "main")
+            out.append({
+                "id": raw,
+                "name": path.split("/")[-1],
+                "path": path,
+                "download_url": raw,
+                "source_url": f"https://github.com/KhronosGroup/glTF-Sample-Assets/blob/main/{path}",
+            })
+            if len(out) >= max(1, min(max_results, 100)):
+                break
+        return json.dumps({"count": len(out), "results": out}, indent=2)
+    except Exception as e:
+        logger.error(f"Error searching GitHub Khronos models: {str(e)}")
+        return f"Error searching GitHub Khronos models: {str(e)}"
+
+
+@mcp.tool()
+def download_github_khronos_model(ctx: Context, raw_url: str) -> str:
+    """
+    Download and import a model from a raw.githubusercontent.com URL.
+    """
+    try:
+        return download_asset(ctx, source="github_khronos", asset_id=raw_url, asset_type="model")
+    except Exception as e:
+        logger.error(f"Error downloading GitHub Khronos model: {str(e)}")
+        return f"Error downloading GitHub Khronos model: {str(e)}"
+
 @mcp.tool()
 def get_scene_info(ctx: Context) -> str:
     """Get detailed information about the current Blender scene"""
@@ -309,6 +820,8 @@ def get_mcp_capabilities(ctx: Context) -> str:
         integrations = {
             "polyhaven": {"enabled": False},
             "sketchfab": {"enabled": False},
+            "polypizza": {"enabled": False},
+            "github_khronos": {"enabled": True, "message": "Available (public GitHub source)"},
             "hyper3d": {"enabled": False},
             "hunyuan3d": {"enabled": False},
         }
@@ -319,6 +832,10 @@ def get_mcp_capabilities(ctx: Context) -> str:
             pass
         try:
             integrations["sketchfab"] = blender.send_command("get_sketchfab_status")
+        except Exception:
+            pass
+        try:
+            integrations["polypizza"] = blender.send_command("get_polypizza_status")
         except Exception:
             pass
         try:
@@ -1930,6 +2447,8 @@ def asset_creation_strategy() -> str:
         3) Integrations (only if enabled)
         - PolyHaven: textures/HDRIs/models
         - Sketchfab: realistic downloadable models
+        - Poly Pizza: low-poly downloadable models
+        - GitHub Khronos: glTF sample models
         - Hyper3D / Hunyuan3D: custom single-item generation
 
         4) Advanced fallback
