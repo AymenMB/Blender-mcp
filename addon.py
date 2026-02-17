@@ -1707,6 +1707,62 @@ class BlenderMCPServer:
 
         return normalized
 
+    def _search_polypizza_html_fallback(self, query, count=20):
+        """Fallback search by parsing public Poly Pizza pages when API endpoints fail."""
+        try:
+            url = f"https://poly.pizza/search/{requests.utils.quote(query)}"
+            res = requests.get(url, headers={"User-Agent": "blender-mcp"}, timeout=30)
+            if res.status_code != 200:
+                return []
+
+            html = res.text
+
+            # Collect ids from /m/<id> links.
+            ids = []
+            for mid in re.findall(r'/m/([A-Za-z0-9_-]+)', html):
+                if mid not in ids:
+                    ids.append(mid)
+                if len(ids) >= count:
+                    break
+
+            results = []
+            for mid in ids:
+                results.append({
+                    "id": mid,
+                    "name": mid,
+                    "triCount": None,
+                    "license": "Unknown",
+                    "download": None,
+                    "thumbnail": None,
+                })
+            return results
+        except Exception:
+            return []
+
+    def _resolve_polypizza_download_from_model_page(self, model_id):
+        """Resolve direct GLB URL from model page as a fallback."""
+        try:
+            page_url = f"https://poly.pizza/m/{model_id}"
+            res = requests.get(page_url, headers={"User-Agent": "blender-mcp"}, timeout=30)
+            if res.status_code != 200:
+                return None
+
+            html = res.text
+
+            # Try absolute GLB URL first
+            match = re.search(r'https://[^\"\']+\\.glb', html, flags=re.IGNORECASE)
+            if match:
+                return match.group(0)
+
+            # Try relative GLB path
+            rel = re.search(r'(/[^\"\']+\\.glb)', html, flags=re.IGNORECASE)
+            if rel:
+                return f"https://poly.pizza{rel.group(1)}"
+
+            return None
+        except Exception:
+            return None
+
     def search_polypizza_models(self, query, count=20):
         """Search Poly Pizza models using API key auth."""
         try:
@@ -1747,6 +1803,15 @@ class BlenderMCPServer:
                     last_error = str(e)
                     continue
 
+            # Fallback: parse public search page
+            fallback_results = self._search_polypizza_html_fallback(query, count=count)
+            if fallback_results:
+                return {
+                    "results": fallback_results,
+                    "count": len(fallback_results),
+                    "source": "html_fallback",
+                }
+
             return {"error": f"Poly Pizza search failed: {last_error or 'unknown error'}"}
         except Exception as e:
             return {"error": str(e)}
@@ -1786,6 +1851,9 @@ class BlenderMCPServer:
                                 break
                     except Exception:
                         continue
+
+                if not resolved_url:
+                    resolved_url = self._resolve_polypizza_download_from_model_page(model_id)
 
             if not resolved_url:
                 return {"error": "No downloadable URL resolved for Poly Pizza model"}
