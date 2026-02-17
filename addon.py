@@ -1719,27 +1719,53 @@ class BlenderMCPServer:
             # Query tokens for strict relevance filtering
             tokens = [t.lower() for t in re.findall(r'[A-Za-z0-9]+', query or "") if len(t) >= 2]
 
-            # Collect candidate model links and optional visible titles directly from search page.
-            # This avoids expensive per-model fetches and is more resilient to API outages.
+            # Collect candidate model links and titles from search page.
+            # PolyPizza MUI cards have model links appearing twice per card:
+            # 1) wrapping the image (no visible text), 2) in card header with title.
+            # We collect ALL title candidates per ID and pick the best one.
             link_matches = re.findall(
-                r'href=["\"]/m/([A-Za-z0-9_-]+)["\"][^>]*>([^<]{1,200})<',
+                r'href=["\']/m/([A-Za-z0-9_-]+)["\'][^>]*>([^<]{0,200})<',
                 page_html,
                 flags=re.IGNORECASE,
             )
 
-            candidate_pairs = []
-            seen_ids = set()
+            # Also extract titles from MUI card media title= attributes
+            card_titles = {}
+            for m in re.finditer(
+                r'href=["\']/m/([A-Za-z0-9_-]+)["\'].*?title="([^"]+)"',
+                page_html,
+                flags=re.IGNORECASE,
+            ):
+                mid, title = m.group(1), m.group(2).strip()
+                if mid and title and title != mid:
+                    card_titles[mid] = title
+
+            # Collect all title candidates per model ID, pick the best
+            id_titles = {}  # model_id -> list of candidate titles
+            ordered_ids = []
             for mid, title in link_matches:
-                if mid in seen_ids:
-                    continue
-                seen_ids.add(mid)
+                if mid not in id_titles:
+                    id_titles[mid] = []
+                    ordered_ids.append(mid)
                 clean_title = (title or "").strip()
-                candidate_pairs.append((mid, clean_title or mid))
+                if clean_title:
+                    id_titles[mid].append(clean_title)
+
+            candidate_pairs = []
+            for mid in ordered_ids:
+                titles = id_titles[mid]
+                # Prefer card_titles (from title= attr), then longest link text, then ID
+                best = card_titles.get(mid)
+                if not best and titles:
+                    # Pick the longest non-empty title (most descriptive)
+                    best = max(titles, key=len)
+                candidate_pairs.append((mid, best or mid))
                 if len(candidate_pairs) >= max(50, count * 5):
                     break
 
             # Fallback if title extraction fails: keep id-only candidates.
             if not candidate_pairs:
+                seen_ids = set()
                 for mid in re.findall(r'/m/([A-Za-z0-9_-]+)', page_html):
                     if mid in seen_ids:
                         continue
@@ -1780,8 +1806,10 @@ class BlenderMCPServer:
                 # Enrich only the top few for performance/reliability.
                 for item in strict_results[:min(5, len(strict_results))]:
                     meta = self._get_polypizza_model_meta(item.get("id")) or {}
-                    if meta.get("name"):
-                        item["name"] = meta.get("name")
+                    # Only overwrite name if meta returned a REAL name (not just model_id)
+                    meta_name = meta.get("name", "")
+                    if meta_name and meta_name != item.get("id"):
+                        item["name"] = meta_name
                     item["license"] = meta.get("license", item.get("license", "Unknown"))
                     item["download"] = meta.get("download") or item.get("download")
                     item["thumbnail"] = meta.get("thumbnail") or item.get("thumbnail")
@@ -1816,13 +1844,21 @@ class BlenderMCPServer:
 
             page_html = html.unescape(res.text)
 
-            # Try OpenGraph title first
+            # Try multiple title extraction methods
             name = None
+
+            # 1. OpenGraph title
             m_title = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', page_html, flags=re.IGNORECASE)
             if m_title:
                 name = m_title.group(1).strip()
 
-            # Optional page title fallback
+            # 2. <h1> tag (PolyPizza uses this for model titles)
+            if not name:
+                h1 = re.search(r'<h1[^>]*>([^<]+)</h1>', page_html, flags=re.IGNORECASE)
+                if h1:
+                    name = h1.group(1).strip()
+
+            # 3. <title> tag fallback
             if not name:
                 t = re.search(r'<title>([^<]+)</title>', page_html, flags=re.IGNORECASE)
                 if t:

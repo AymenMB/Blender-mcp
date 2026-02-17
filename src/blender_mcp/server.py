@@ -291,6 +291,76 @@ def _license_passes_filter(license_label: str, license_filter: str) -> bool:
     return True
 
 
+def _query_tokens(query: str) -> List[str]:
+    return [t.lower() for t in __import__("re").findall(r"[A-Za-z0-9]+", query or "") if len(t) >= 2]
+
+
+def _normalize_token(token: str) -> str:
+    t = (token or "").lower().strip()
+    if t.endswith("s") and len(t) > 3:
+        return t[:-1]
+    return t
+
+
+def _text_tokens(text: str) -> set[str]:
+    toks = [t.lower() for t in __import__("re").findall(r"[A-Za-z0-9]+", text or "") if len(t) >= 2]
+    out = set()
+    for t in toks:
+        out.add(t)
+        out.add(_normalize_token(t))
+    return out
+
+
+def _is_specific_query(query: str) -> bool:
+    tokens = _query_tokens(query)
+    # Heuristic: single-token prompts (e.g. "mercedes", "pikachu") should remain strict.
+    return len(tokens) == 1 and len(tokens[0]) >= 3
+
+
+def _query_variants(query: str) -> List[str]:
+    q = (query or "").strip()
+    if not q:
+        return [q]
+    variants = [q]
+    tokens = _query_tokens(q)
+    collapsed = " ".join(tokens)
+    if collapsed and collapsed not in variants:
+        variants.append(collapsed)
+
+    # Progressive relaxation for multi-token queries, no hardcoded token list.
+    if len(tokens) > 1:
+        for cand in [tokens[-1], tokens[0]]:
+            if cand and cand not in variants:
+                variants.append(cand)
+        for tok in tokens:
+            if tok not in variants and len(tok) >= 3:
+                variants.append(tok)
+        for tok in tokens:
+            if tok.endswith("s") and len(tok) > 3:
+                singular = tok[:-1]
+                if singular and singular not in variants:
+                    variants.append(singular)
+    return variants
+
+
+def _relevance_score(item: Dict[str, Any], query: str) -> int:
+    qtokens = _query_tokens(query)
+    if not qtokens:
+        return 0
+    hay = " ".join([
+        str(item.get("title", "")),
+        " ".join(item.get("tags", []) if isinstance(item.get("tags"), list) else []),
+        str(item.get("source_url", "")),
+    ])
+    hay_tokens = _text_tokens(hay)
+    score = 0
+    for t in qtokens:
+        tn = _normalize_token(t)
+        if tn in hay_tokens or t in hay_tokens:
+            score += 1
+    return score
+
+
 def _normalize_polyhaven_assets(assets: Dict[str, Any], category: str) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     for asset_id, asset_data in (assets or {}).items():
@@ -341,6 +411,50 @@ def _github_raw_url(repo: str, path: str, branch: str = "main") -> str:
     return f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
 
 
+def _polyhaven_search_direct(query: str, category: str, max_results: int) -> List[Dict[str, Any]]:
+    """Direct PolyHaven semantic-ish search by scoring name/id/categories text."""
+    category_map = {
+        "model": "models",
+        "texture": "textures",
+        "hdri": "hdris",
+    }
+    asset_type = category_map.get((category or "model").lower(), "models")
+
+    params = urllib.parse.urlencode({"type": asset_type})
+    url = f"https://api.polyhaven.com/assets?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": "blender-mcp"})
+    with urllib.request.urlopen(req, timeout=40) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+
+    qtokens = [_normalize_token(t) for t in _query_tokens(query)]
+    scored: List[tuple[int, Dict[str, Any]]] = []
+    for asset_id, asset_data in (payload or {}).items():
+        title = str(asset_data.get("name", asset_id))
+        cats = asset_data.get("categories", []) if isinstance(asset_data.get("categories"), list) else []
+        hay_tokens = _text_tokens(f"{asset_id} {title} {' '.join(cats)}")
+        score = 0
+        for t in qtokens:
+            if t in hay_tokens:
+                score += 1
+        if qtokens and score == 0:
+            continue
+        normalized = {
+            "source": "polyhaven",
+            "asset_id": asset_id,
+            "title": title,
+            "category": category,
+            "tags": cats,
+            "license_label": "CC0",
+            "download_count": asset_data.get("download_count", 0),
+            "source_url": f"https://polyhaven.com/a/{asset_id}",
+            "query_used": query,
+        }
+        scored.append((score, normalized))
+
+    scored.sort(key=lambda x: (-x[0], -(x[1].get("download_count") or 0), x[1].get("title", "")))
+    return [item for _, item in scored[:max_results]]
+
+
 @mcp.tool()
 def search_asset_sources(
     ctx: Context,
@@ -361,7 +475,14 @@ def search_asset_sources(
     - providers: optional list from ["polyhaven", "sketchfab", "polypizza", "github_khronos"]
     """
     try:
-        blender = get_blender_connection()
+        blender: Optional[BlenderConnection] = None
+
+        def _blender() -> BlenderConnection:
+            nonlocal blender
+            if blender is None:
+                blender = get_blender_connection()
+            return blender
+
         category = (category or "model").lower()
         max_results = min(max(1, max_results), 50)
 
@@ -369,26 +490,26 @@ def search_asset_sources(
         all_candidates: List[Dict[str, Any]] = []
         used_providers: List[str] = []
 
+        variants = _query_variants(query)
+
         if "polyhaven" in requested:
             try:
-                asset_type = {
-                    "model": "models",
-                    "texture": "textures",
-                    "hdri": "hdris",
-                }.get(category, "all")
-                poly = blender.send_command("search_polyhaven_assets", {
-                    "asset_type": asset_type,
-                    "categories": query,
-                })
-                if isinstance(poly, dict) and "assets" in poly:
+                poly_added = False
+                for qv in variants:
+                    normalized = _polyhaven_search_direct(qv, category, max_results)
+                    if normalized:
+                        all_candidates.extend(normalized)
+                        poly_added = True
+                        if _is_specific_query(query):
+                            break
+                if poly_added:
                     used_providers.append("polyhaven")
-                    all_candidates.extend(_normalize_polyhaven_assets(poly.get("assets", {}), category))
             except Exception:
                 pass
 
         if "sketchfab" in requested and category == "model":
             try:
-                sk = blender.send_command("search_sketchfab_models", {
+                sk = _blender().send_command("search_sketchfab_models", {
                     "query": query,
                     "count": max_results,
                     "downloadable": True,
@@ -401,13 +522,29 @@ def search_asset_sources(
 
         if "polypizza" in requested and category == "model":
             try:
-                pz = blender.send_command("search_polypizza_models", {
-                    "query": query,
-                    "count": max_results,
-                })
-                if isinstance(pz, dict) and isinstance(pz.get("results"), list):
-                    used_providers.append("polypizza")
+                pz_items: List[Dict[str, Any]] = []
+                seen_ids = set()
+                for qv in variants:
+                    pz = _blender().send_command("search_polypizza_models", {
+                        "query": qv,
+                        "count": max_results,
+                    })
+                    if not (isinstance(pz, dict) and isinstance(pz.get("results"), list)):
+                        continue
                     for item in pz.get("results", []):
+                        item_id = item.get("id")
+                        if item_id and item_id in seen_ids:
+                            continue
+                        if item_id:
+                            seen_ids.add(item_id)
+                        pz_items.append({**item, "_query_used": qv})
+                    # For specific queries, avoid over-broadening once we have direct hits.
+                    if pz_items and _is_specific_query(query):
+                        break
+
+                if pz_items:
+                    used_providers.append("polypizza")
+                    for item in pz_items:
                         all_candidates.append({
                             "source": "polypizza",
                             "asset_id": item.get("id"),
@@ -418,6 +555,7 @@ def search_asset_sources(
                             "tri_count": item.get("triCount"),
                             "download_url": item.get("download"),
                             "thumbnail_url": item.get("thumbnail"),
+                            "query_used": item.get("_query_used"),
                             "source_url": f"https://poly.pizza/m/{item.get('id')}" if item.get("id") else None,
                         })
             except Exception:
@@ -427,12 +565,12 @@ def search_asset_sources(
             try:
                 tree = _github_api_json("https://api.github.com/repos/KhronosGroup/glTF-Sample-Assets/git/trees/main?recursive=1")
                 used_providers.append("github_khronos")
-                q = (query or "").lower().strip()
+                variants_l = [v.lower().strip() for v in variants if v.strip()]
                 for node in tree.get("tree", []):
                     path = node.get("path", "")
                     if not path.lower().endswith((".glb", ".gltf")):
                         continue
-                    if q and q not in path.lower():
+                    if variants_l and not any(v in path.lower() for v in variants_l):
                         continue
                     raw = _github_raw_url("KhronosGroup/glTF-Sample-Assets", path, "main")
                     all_candidates.append({
@@ -453,10 +591,28 @@ def search_asset_sources(
             if _license_passes_filter(item.get("license_label", ""), license_filter)
         ]
 
+        for item in filtered:
+            item["relevance_score"] = _relevance_score(item, query)
+
+        # Keep strict intent for specific queries to avoid unrelated substitutions.
+        if _is_specific_query(query):
+            strict = [i for i in filtered if i.get("relevance_score", 0) > 0]
+            if strict:
+                filtered = strict
+
         if category == "model":
-            filtered.sort(key=lambda x: (x.get("source") != "sketchfab", -(x.get("face_count") or 0)))
+            source_rank = {"sketchfab": 0, "polypizza": 1, "github_khronos": 2, "polyhaven": 3}
+            filtered.sort(key=lambda x: (
+                -(x.get("relevance_score") or 0),
+                source_rank.get(x.get("source"), 9),
+                -(x.get("face_count") or 0),
+            ))
         else:
-            filtered.sort(key=lambda x: (x.get("source") != "polyhaven", -(x.get("download_count") or 0)))
+            filtered.sort(key=lambda x: (
+                -(x.get("relevance_score") or 0),
+                x.get("source") != "polyhaven",
+                -(x.get("download_count") or 0),
+            ))
 
         result = {
             "query": query,
@@ -482,7 +638,6 @@ def get_asset_license(ctx: Context, source: str, asset_id: str) -> str:
     - asset_id: provider-specific asset id/uid
     """
     try:
-        blender = get_blender_connection()
         src = (source or "").lower().strip()
 
         if src == "polyhaven":
@@ -498,6 +653,7 @@ def get_asset_license(ctx: Context, source: str, asset_id: str) -> str:
             return json.dumps(result, indent=2)
 
         if src == "sketchfab":
+            blender = get_blender_connection()
             result = _handle_result(blender.send_command("get_sketchfab_model_license", {"uid": asset_id}))
             return json.dumps(result, indent=2)
 
