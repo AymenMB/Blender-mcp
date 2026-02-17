@@ -347,9 +347,21 @@ def _relevance_score(item: Dict[str, Any], query: str) -> int:
     qtokens = _query_tokens(query)
     if not qtokens:
         return 0
+    # Extract tag strings — handle both plain strings and Sketchfab dicts
+    raw_tags = item.get("tags", [])
+    if isinstance(raw_tags, list):
+        tag_strs = []
+        for t in raw_tags:
+            if isinstance(t, str):
+                tag_strs.append(t)
+            elif isinstance(t, dict):
+                tag_strs.append(t.get("name", t.get("slug", "")))
+        tags_text = " ".join(tag_strs)
+    else:
+        tags_text = ""
     hay = " ".join([
         str(item.get("title", "")),
-        " ".join(item.get("tags", []) if isinstance(item.get("tags"), list) else []),
+        tags_text,
         str(item.get("source_url", "")),
     ])
     hay_tokens = _text_tokens(hay)
