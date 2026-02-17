@@ -1752,7 +1752,7 @@ class BlenderMCPServer:
 
             # Prefer static Poly Pizza binary links directly.
             static_matches = re.findall(
-                r'https://static\.poly\.pizza/[^\"\'\s>]+\\.glb(?:\\.br)?',
+                r'https://static\.poly\.pizza/[^\"\'\s>]+\.glb(?:\.br)?',
                 page_html,
                 flags=re.IGNORECASE,
             )
@@ -1769,7 +1769,7 @@ class BlenderMCPServer:
 
             # Some pages embed viewer URLs with src=<glb_url> query param.
             src_param_match = re.search(
-                r'src=(https://static\.poly\.pizza/[^&\"\'\s>]+\\.glb)',
+                r'src=(https://static\.poly\.pizza/[^&\"\'\s>]+\.glb)',
                 page_html,
                 flags=re.IGNORECASE,
             )
@@ -1777,12 +1777,12 @@ class BlenderMCPServer:
                 return src_param_match.group(1)
 
             # Generic absolute .glb fallback
-            match = re.search(r'https://[^\"\']+\\.glb', page_html, flags=re.IGNORECASE)
+            match = re.search(r'https://[^\"\']+\.glb', page_html, flags=re.IGNORECASE)
             if match:
                 return match.group(0)
 
             # Try relative GLB path fallback
-            rel = re.search(r'(/[^\"\']+\\.glb)', page_html, flags=re.IGNORECASE)
+            rel = re.search(r'(/[^\"\']+\.glb)', page_html, flags=re.IGNORECASE)
             if rel:
                 return f"https://poly.pizza{rel.group(1)}"
 
